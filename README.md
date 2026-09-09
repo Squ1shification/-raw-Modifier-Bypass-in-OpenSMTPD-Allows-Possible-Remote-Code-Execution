@@ -91,7 +91,7 @@ Remediation must move beyond reactionary patching to address the structural flaw
 
 4. **Allowlist Tightening:** Tighten the MAILADDR\_ALLOWED allowlist in util.c:417. Characters such as \`, $, {, }, and | serve no legitimate purpose in the local-part production of RFC 5321 and should be removed to block exploits at Layer 1\.
 
-This exploit PoC script written in Python was demonstrated in the video:
+This exploit PoC script written establishes a stable reverse shell:
 ```python
 import argparse
 import base64

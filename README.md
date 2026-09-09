@@ -85,8 +85,40 @@ The vulnerable execution path is particularly important because the MDA processi
 
 In `mda_unpriv.c`, the MDA command is executed through:
 
-```text
+```bash
 /bin/sh -c
+```
+
+This shell receives the command after OpenSMTPD has performed its token expansion.
+
+When the `:raw` modifier is used, shell metacharacters contained in the expanded value can remain intact. If those characters form valid shell syntax, they can therefore be interpreted by this shell.
+
+### Second Shell
+
+The MDA delivery utility introduces another shell interpretation path through its use of `system()`.
+
+`system()` invokes a shell to execute the supplied command. This means that values originating from variables such as `$SENDER` can potentially undergo another round of shell parsing after being passed through the first stage.
+
+The two execution paths should not be treated as identical. The `:raw` path can result in shell interpretation during the initial command execution, while the environment-variable path depends on how the MDA subsequently constructs and executes the command.
+
+This distinction matters when reproducing the vulnerability because the exact behavior depends on the MDA configuration and the location at which the attacker-controlled value is introduced into the command.
+
+---
+
+## 4. Exploitation
+
+An attacker can reach the vulnerable functionality through an unauthenticated SMTP connection when the target is configured with an affected MDA execution path.
+
+The basic exploitation concept is to place shell-significant characters into an SMTP envelope value that will later be incorporated into an MDA command.
+
+Because the SMTP local-part validation restricts whitespace, payload construction may require shell features that do not depend on literal spaces. For example, `${IFS}` can represent whitespace during shell expansion.
+
+A minimal proof of command execution can therefore be constructed around a harmless filesystem operation, such as creating a file in `/tmp`.
+
+### Proof of Concept
+
+```text
+MAIL FROM:<...>
 ```python
 import argparse
 import base64

